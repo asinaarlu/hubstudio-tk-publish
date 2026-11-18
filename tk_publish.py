@@ -2817,16 +2817,34 @@ def cmd_watchdog(cfg, api, args):
 # 口径来自用户 2026-11-17 的要求：任务建完 15 分钟查一次发布结果；下一轮发布前 15 分钟
 # 再查上一轮；没发出去的自动重发，并记下检查结果和重试状态，别重复触发。
 #
-# 为什么不是「点客户端那个重试按钮」：它走的是 v1/cloud-mobile/task-main/retry 和
-# task-detail/retry，两条都不在本地开放接口白名单里（白名单只有 11 条 tk-automation，
-# 2026-11-17 又从 app.asar 逐条数过、并拿空 body 直连 6873 复验：一律 E010006 请检查请求路径是否正确）。
-# P5 也不许去点界面。所以这里用唯一允许的写路径 video-task/create 给这条视频重建一个发布任务，
-# payload 直接从原计划取（不重传视频、不重新解析文案），效果就是「重新发布对应视频」。
+# 为什么不是「点客户端那个重试按钮」：
+# 录屏（2026-11-18 任务详情页）识别到两种重跑：
+#   ① 行内「重试」（失败行操作列）→ restartTask → 内部路由
+#      /cloud-mobile//v1/cloud-mobile/task-detail/retry，参数体 {id: <执行行内部行id>}；
+#      点完该行状态变「等待运行」、计划时间刷新到当下，顶部弹「重试成功」toast，不重选素材/文案。
+#   ② 顶部「批量重试」→ batchRetryTask → 内部路由
+#      /cloud-mobile/v1/cloud-mobile/task-main/retry，参数体 {taskId}；先弹确认框
+#      「确定重试所有失败任务吗？不含取消的失败任务数：N，继续将重新开机并产生费用，请确认。」
+# 这两条都不在本地开放接口白名单里（白名单只有 11 条 tk-automation，
+# 2026-11-17 从 app.asar 逐条数过；2026-11-18 又拿空 body 直连 6873 复验 task-detail/retry、
+# task-main/retry 及多种前缀写法，一律 E010006 请检查请求路径是否正确）。
+# 另外开放接口 task/execution/page 只回 executionId/mobileId/status/result/errorCode…，
+# 不回行内重试要的内部行 id，即便路由放行也缺锚点。P5 也不许去点界面。所以这里用唯一允许的
+# 写路径 video-task/create 给这条视频重建一个发布任务，payload 直接从原计划取（不重传视频、
+# 不重新解析文案），效果就是「重新发布对应视频」；这是后台对客户端「行内重试」的等价实现。
 #
 # 安全边界：只查本脚本自己建的任务（状态里 tasks/retryTasks 记的那些），绝不碰用户手工建的
 # mt_* 任务；「结果不明」（已有 publishedUrl，或错误码 4041/E114204）一律不自动重发——
 # 那种很可能已经发出去了，再发就是同账号两条一样内容，掉权重（2026-11-17 定的口径）；
-# 重发同样守「同一台环境 >=30 分钟、当天不越过 22:00、一个任务里同台只出现一次」。
+# 重发同样守「当天不越过 22:00、一个任务里同台只出现一次、给这台还没发的轮次让位」。
+#
+# 2026-11-18 用户口径：「完善一下自检遇到失败时，直接点击重试就ok」。落到代码上是三件事：
+#   1) 明确失败（FAILED 且没链接、不是 4041/E114204）不再傻等「上次+30 分钟」，当场重发——
+#      那次尝试根本没发出去，不占发布间隔，客户端点重试也是这个节奏（--retry-wait-gap 退回旧行为）。
+#   2) 别人（用户自己在客户端）点了重试，接口里是同一 executionId 原地重跑：这时撤掉自己排好的
+#      pending、不再建重发任务，两边撞车就是同账号双发。今天 11:05:50 就是这个场景。
+#   3) 给「一键重发某任务全部失败条目」补个正主子命令 retry（旧日志里让人「手动 retry --force」
+#      是句空话，那时根本没这个命令）。
 # ----------------------------------------------------------------------------
 AMBIGUOUS_CODES = {"4041", "E114204"}      # 发布动作可能已做完、只是没取到状态：绝不自动重发
 CHECK_AFTER_MIN = 15                       # 任务建完多少分钟后查第一次
@@ -2865,7 +2883,8 @@ def load_check_state(cfg):
             log("[警告] 自检状态 %s 读不出，这次按空状态走（不动原文件）" % p)
     if not isinstance(d, dict):
         d = {}
-    for k, v in (("checks", {}), ("retries", {}), ("retryTasks", {}), ("pending", [])):
+    for k, v in (("checks", {}), ("retries", {}), ("retryTasks", {}), ("pending", []),
+                 ("externalRetries", [])):
         d.setdefault(k, v)
     return d
 
@@ -2954,6 +2973,27 @@ def classify_execution(row, now, created=None):
     return ("pending", "%s 还没终态%s" % (status or "空状态", late))
 
 
+def externally_rerun(prev_item, row):
+    """这条执行是不是被人在客户端点了「重试/批量重试」原地重跑了。
+
+    按钮的指纹（2026-11-18 实测同一任务的三条失败行）：executionId 不变，startedAt 被刷到
+    更晚的一刻，状态从 FAILED 回到 RUNNING，链接/错误码是重跑后的新值。
+    开放接口没有重试路由，所以这种重跑一定是界面侧或别人干的；我们得认出来，别再发一遍。
+    返回 (是否重跑, 说明)。
+    """
+    if not prev_item:
+        return False, ""
+    a, b = _ts(prev_item.get("startedAt")), _ts(row.get("startedAt"))
+    if a and b and b > a:
+        return True, "startedAt %s -> %s" % (a.strftime("%H:%M:%S"), b.strftime("%H:%M:%S"))
+    pa = str(prev_item.get("status") or "").upper()
+    pb = str(row.get("status") or "").upper()
+    if pa in ("FAILED", "FAILURE", "ERROR") and pb in ("RUNNING", "PENDING", "QUEUED",
+                                                       "WAITING", "SCHEDULED", "CREATED"):
+        return True, "%s -> %s" % (pa, pb or "空")
+    return False, ""
+
+
 def active_plan(cfg):
     """锁里那份计划（没锁就取最新一份）-> (path, sched)。sched 里每条带 when/item/detail/round/done。
     读不出、条数对不上、时刻/URL 有空的，一律给空 sched —— 自检不能因为计划文件坏就跟着死。"""
@@ -3016,11 +3056,13 @@ def last_publish_by_mobile(cfg, cs, today):
     return out
 
 
-def check_pass(cfg, api, args, now=None, reason="", read_only=False):
+def check_pass(cfg, api, args, now=None, reason="", read_only=False, only=None):
     """查一遍今天本脚本建的任务的执行结果，写进自检状态。
 
     返回 (可重发清单, 统计, cs, st)。默认只读：只有 task/execution/page，不建任务、不改守护进程状态。
     read_only=True 时结果不落盘（自检守护进程正在跑，两边各写各的会把同一条重发两遍）。
+    only=[taskId...] 时只查这些任务（retry 子命令用），不在今天名单里的也从 state 里捞出来查；
+    配 --force-check 连「建完未满 --check-after 分钟」和「上次已终态」两道跳过也一并绕过。
     """
     now = now or datetime.now()
     st = load_sched_state(cfg)
@@ -3031,24 +3073,38 @@ def check_pass(cfg, api, args, now=None, reason="", read_only=False):
     checks = cs.setdefault("checks", {})
     cache = {}
     retryable = []
+    rerun_keys = set()
     stats = {"tasks": 0, "items": 0, "ok": 0, "pending": 0, "ambiguous": 0,
-             "retryable": 0, "cancelled": 0, "unreadable": 0, "skipped": 0,
+             "retryable": 0, "cancelled": 0, "unreadable": 0, "skipped": 0, "rerun": 0,
              "next_due": None}
     today = now.strftime("%Y-%m-%d")
+    force = bool(getattr(args, "force_check", False))
     watch = [(tid, rec, "schedule") for tid, rec in (st.get("tasks") or {}).items()
              if isinstance(rec, dict) and str(rec.get("createdAt") or "")[:10] == today]
     watch += [(tid, rec, "retry") for tid, rec in (cs.get("retryTasks") or {}).items()
               if isinstance(rec, dict) and str(rec.get("createdAt") or "")[:10] == today]
+    stats["not_found"] = []
+    if only:
+        have = {str(t[0]) for t in watch}
+        for tid2, rec2 in (st.get("tasks") or {}).items():        # 昨天建的也能点名重查
+            if str(tid2) in {str(o) for o in only} and str(tid2) not in have \
+                    and isinstance(rec2, dict):
+                watch.append((tid2, rec2, "manual"))
+                have.add(str(tid2))
+        watch = [w for w in watch if str(w[0]) in {str(o) for o in only}]
+        stats["not_found"] = [str(o) for o in only if str(o) not in {str(w[0]) for w in watch}]
     watch.sort(key=lambda x: str(x[1].get("createdAt") or ""))
     for tid, rec, src in watch:
         created = _ts(rec.get("createdAt")) or _ts(rec.get("scheduledFor"))
-        if created and (now - created).total_seconds() < after * 60:
+        if created and not force and (now - created).total_seconds() < after * 60:
             stats["skipped"] += 1
             due = created + timedelta(minutes=after)
             if stats["next_due"] is None or due < stats["next_due"]:
                 stats["next_due"] = due                 # 记下最早该查的时刻，别让守护进程空转
             continue                                    # 还没到「建完 15 分钟」，下一圈再来
         prev = checks.get(tid) or {}
+        prev_items = {str(i.get("executionId")): i for i in (prev.get("items") or [])
+                      if i.get("executionId")}
         if prev.get("terminal") and not getattr(args, "force_check", False):
             stats["skipped"] += 1
             continue                                    # 上次已查成终态，不再重复查（也就不会重复重试）
@@ -3075,8 +3131,16 @@ def check_pass(cfg, api, args, now=None, reason="", read_only=False):
         for x in rows:
             m = names.get(str(x.get("mobileId"))) or {}
             kind, why = classify_execution(x, now, created)
-            if kind == "ambiguous" and getattr(args, "retry_ambiguous", False):
+            relaxed = kind == "ambiguous" and bool(getattr(args, "retry_ambiguous", False))
+            if relaxed:
                 kind, why = "retryable", "按 --retry-ambiguous 放宽：%s" % why
+            # 客户端「重试/批量重试」是同一 executionId 原地重跑：认出来就别再自己发一遍，
+            # 之前排好的重发也撤掉（今天 11:05:50 那三条就是这么撞上的）。
+            rerun, rerun_why = externally_rerun(prev_items.get(str(x.get("executionId"))), x)
+            if rerun and kind == "retryable" and not relaxed:
+                kind, why = "pending", "已被客户端重试（%s），先看它自己的结果｜原判定：%s" % (rerun_why, why)
+            elif rerun:
+                why = "%s｜已被客户端重试（%s）" % (why, rerun_why)
             items.append({"mobileId": x.get("mobileId"), "name": m.get("name") or "",
                           "mobile": m.get("mobile") or "", "executionId": x.get("executionId"),
                           "status": x.get("status"), "errorCode": x.get("errorCode"),
@@ -3084,6 +3148,7 @@ def check_pass(cfg, api, args, now=None, reason="", read_only=False):
                           "url": ((x.get("result") or {}) or {}).get("publishedUrl") or "",
                           "scheduledAt": x.get("scheduledAt"), "startedAt": x.get("startedAt"),
                           "finishedAt": x.get("finishedAt"), "kind": kind, "why": why,
+                          "rerun": rerun_why if rerun else "", "relaxed": relaxed,
                           "index": m.get("index"), "plan": m.get("plan")})
             cnt[kind] = cnt.get(kind, 0) + 1
             stats["items"] += 1
@@ -3092,6 +3157,22 @@ def check_pass(cfg, api, args, now=None, reason="", read_only=False):
                 % (rec.get("taskName"), tid, now.strftime("%H:%M"),
                    m.get("name") or "（对不上计划里的名字）",
                    (m.get("mobile") or x.get("mobileId")), x.get("status"), kind, why))
+            if rerun:
+                stats["rerun"] += 1
+                rerun_keys.add(str(m.get("name") or "").lower())
+                cs.setdefault("externalRetries", []).append({
+                    "at": now.strftime(TIME_FMT), "taskId": tid, "taskName": rec.get("taskName"),
+                    "executionId": x.get("executionId"), "mobileId": x.get("mobileId"),
+                    "name": m.get("name") or "", "mobile": m.get("mobile") or "",
+                    "was": "%s %s" % ((prev_items.get(str(x.get("executionId"))) or {}).get("status"),
+                                      (prev_items.get(str(x.get("executionId"))) or {}).get("errorCode")),
+                    "now": "%s %s" % (x.get("status"), x.get("errorCode")), "how": rerun_why})
+                cs["externalRetries"] = cs["externalRetries"][-200:]
+                log("[外部重试] 任务=%s taskId=%s 检查=%s 视频=%s 环境=%s 执行=%s：%s —— "
+                    "接口里这条已经被重跑（客户端点了重试），本轮不建重发任务，排好的重发也撤掉"
+                    % (rec.get("taskName"), tid, now.strftime("%H:%M"), m.get("name") or "?",
+                       (m.get("mobile") or x.get("mobileId")), x.get("executionId"), rerun_why))
+                continue
             if kind != "retryable":
                 continue
             if m.get("index") is None:
@@ -3101,6 +3182,9 @@ def check_pass(cfg, api, args, now=None, reason="", read_only=False):
                               "index": m["index"], "name": m.get("name") or "", "mobileId": x.get("mobileId"),
                               "mobile": m.get("mobile") or "", "sentAt": m.get("at") or "",
                               "why": why, "executionId": x.get("executionId"), "source": src,
+                              # 「结果不明被放宽」的条目不享受当场重发，仍旧要等满间隔：
+                              # 它可能已经发出去了，抢那 30 分钟没意义，撞车才要命。
+                              "relaxed": relaxed,
                               # 去重单位是「这条视频」，不是「某个任务的某一行」：重发建的任务再失败，
                               # 键还是同一个名字，max_retry 才拦得住「重试套重试」。
                               "key": (str(m.get("name") or "").lower()
@@ -3109,35 +3193,56 @@ def check_pass(cfg, api, args, now=None, reason="", read_only=False):
                        "checkedAt": now.strftime(TIME_FMT), "reason": reason, "source": src,
                        "terminal": bool(items) and all(i["kind"] in CLEAR_KINDS for i in items),
                        "counts": cnt, "items": items}
+    rerun_keys.discard("")
+    if rerun_keys and cs.get("pending"):
+        keep = [p for p in cs["pending"] if str(p.get("key") or "").lower() not in rerun_keys]
+        if len(keep) != len(cs["pending"]):
+            dropped = [str(p.get("name") or "?") for p in cs["pending"]
+                       if str(p.get("key") or "").lower() in rerun_keys]
+            cs["pending"] = keep
+            log("[撤重发] %d 条不再自己发（客户端那边已经重跑）：%s"
+                % (len(dropped), "、".join(dropped)))
     save_check_state(cfg, cs)
     return retryable, stats, cs, st
 
 
-def retry_slot(cfg, args, cs, mobile_id, sent_at, now, sched):
-    """这条重发最早能落在什么时候：
-       max(now, 这台今天最后一次发布 + 间隔下限)，并且躲开这台接下来还没发的轮次（前后都要 >= 间隔），
-       且不越过当天 day_last_deadline。返回 (时刻 or None, 说明)。"""
+def retry_slot(cfg, args, cs, mobile_id, sent_at, now, sched, immediate=False):
+    """这条重发落在什么时候。
+
+    immediate=True（明确失败：FAILED 且没有链接，也不是 4041/E114204）= 当场重发，跟客户端点
+      「重试」一个节奏，不再等满 min_spacing_minutes——上一次根本没发出去任何东西，不该占发布间隔
+      （用户 2026-11-18 口径「自检遇到失败时，直接点击重试就ok」）。
+    immediate=False（结果不明被 --retry-ambiguous 放宽，或 --retry-wait-gap 要退回旧行为）
+      = 仍旧 max(now, 这台今天最后一次发布 + 间隔下限)。
+    两种都要躲开这台接下来还没发的轮次（前后各 >= 间隔），且不越过当天 day_last_deadline；
+    --retry-now 连让位都不管（自己确认要把同一台间隔压短才用）。返回 (时刻 or None, 说明)。
+    """
     gap = max(int(cfg["publish"].get("min_spacing_minutes", MIN_SPACING_FLOOR)), 1)
     hour, minute = parse_deadline(cfg["publish"].get("day_last_deadline", DEFAULT_DAY_DEADLINE))
     dl = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if dl <= now:
         return None, "今天 %s 已过，这条不排（明天重跑 plan 再说）" % dl.strftime("%H:%M")
-    last = last_publish_by_mobile(cfg, cs, now.strftime("%Y-%m-%d")).get(str(mobile_id))
-    when = now
-    if last:
-        earliest = last + timedelta(minutes=gap)
-        if earliest > when:
-            when = earliest.replace(second=0, microsecond=0)
+    when, why_slot = now, "明确失败没发出去，按客户端点重试的节奏当场重发"
+    last = None
+    if not immediate:
+        last = last_publish_by_mobile(cfg, cs, now.strftime("%Y-%m-%d")).get(str(mobile_id))
+        if last:
+            earliest = last + timedelta(minutes=gap)
+            if earliest > when:
+                when = earliest.replace(second=0, microsecond=0)
+        why_slot = "上次 %s + %d 分钟" % ((last.strftime("%H:%M") if last else "无记录"), gap)
     if getattr(args, "retry_now", False):
-        when = now
+        return now, "立刻重发（--retry-now，连让位也不等）"
     nxt = [s["when"] for s in sched if not s["done"] and str(s["item"].get("mobileId")) == str(mobile_id)]
     if nxt and when < nxt[0] and nxt[0] - when < timedelta(minutes=gap):
         when = nxt[0] + timedelta(minutes=gap)
         log("[让位] %s 这台 %s 的下一轮在 %s，重发往后挪到 %s，免得把同一台的间隔压短"
             % (sent_at or "?", mobile_id, nxt[0].strftime("%H:%M"), when.strftime("%H:%M")))
+        why_slot = "%s；又给 %s 的下一轮让位到 %s" % (why_slot, nxt[0].strftime("%H:%M"),
+                                                     when.strftime("%H:%M"))
     if when > dl:
         return None, "挪完就越过今天 %s 了（间隔规则优先），这条交人工/明天" % dl.strftime("%H:%M")
-    return when, "上次 %s + %d 分钟" % ((last.strftime("%H:%M") if last else "无记录"), gap)
+    return when, why_slot
 
 
 def create_retry_tasks(cfg, api, args, cs, batch, now, base_name):
@@ -3204,14 +3309,18 @@ def token_matches_plan(cfg, args, data, name=""):
 
 
 def retry_pass(cfg, api, args, cs, items, now=None):
-    """明确失败的条目 -> 按间隔规则算时刻 -> 到点建重发任务。
+    """明确失败的条目 -> 算时刻 -> 建重发任务（后台等价客户端「重试」按钮）。
 
-    不满足「现在就能发」的先进 cs["pending"]，由 checkd 到点再发（或 --retry-now 立刻发）。
+    2026-11-18 起的默认：明确失败当场重发，不再等「上次发布+30 分钟」；只有跟这台还没发的轮次
+    撞间隔的才先进 cs["pending"]，由 checkd 到点再发（--retry-wait-gap 退回旧行为，
+    --retry-now 连让位都不等）。结果不明被 --retry-ambiguous 放宽的那些仍旧等满间隔。
     每条最多 --max-retry 次，超过就只报不试，避免重试套重试。
     同一圈里同一条只排一次：一条视频在一个 pass 里最多烧掉一次重试额度。
     """
     now = now or datetime.now()
     max_retry = max(int(getattr(args, "max_retry", 1)), 0)
+    immediate_ok = (not getattr(args, "retry_wait_gap", False)) \
+        and bool(getattr(args, "retry_immediate", True))
     _path, sched = active_plan(cfg)
     cache, batches, deferred, blocked = {}, [], [], []
     queued, seen = {}, set()
@@ -3240,7 +3349,8 @@ def retry_pass(cfg, api, args, cs, items, now=None):
         if problems:
             blocked.append("%s（重发前自检没过：%s）" % (it["name"], "；".join(problems[:2])))
             continue
-        when, why_slot = retry_slot(cfg, args, cs, it["mobileId"], it.get("sentAt"), now, sched)
+        when, why_slot = retry_slot(cfg, args, cs, it["mobileId"], it.get("sentAt"), now, sched,
+                                    immediate=(immediate_ok and not it.get("relaxed")))
         if when is None:
             blocked.append("%s（%s）" % (it["name"], why_slot))
             continue
@@ -3286,11 +3396,14 @@ def retry_pass(cfg, api, args, cs, items, now=None):
     return len(batches), len(deferred), len(blocked)
 
 
-def still_failed(cfg, api, tid, exid):
+def still_failed(cfg, api, tid, exid, since=None):
     """到点真要重发前，再看一眼原执行现在的状态。
 
-    今天见过 RUNNING 带链接、几分钟后自己变 SUCCEEDED 的（露营灯-13），
+    今天见过 RUNNING 带链接、几分钟后自己变 SUCCEEDED 的（示例产品A-01），
     顺延期间它可能已经发出去了，这时候再发就是同账号两条一样内容。
+    since = 当初排这条 pending 时的发单时刻：接口里 startedAt 比它新，说明有人在客户端点了
+    「重试/批量重试」原地重跑（2026-11-18 实测同 executionId、startedAt 被刷新），
+    这时重跑自己要么在跑、要么又失败了——在跑就别抢，又失败照旧该发。
     """
     if not tid or not exid:
         return False, "pending 里没带原任务或原执行，不猜"
@@ -3298,9 +3411,14 @@ def still_failed(cfg, api, tid, exid):
         rows = api.executions(tid, size=50)
     except ApiError as e:
         return False, "原任务读不到了（%s），当不成功也不当失败" % e.res.get("code")
+    a = _ts(since)
     for r in rows:
         if str(r.get("executionId")) == str(exid):
             kind, why = classify_execution(r, datetime.now())
+            b = _ts(r.get("startedAt"))
+            if a and b and b > a:
+                why = "客户端已重跑（%s -> %s）：%s" % (a.strftime("%H:%M:%S"),
+                                                       b.strftime("%H:%M:%S"), why)
             if kind == "retryable":
                 return True, why
             return False, "现在判定是 %s：%s" % (kind, why)
@@ -3336,7 +3454,8 @@ def flush_pending(cfg, api, args, cs, now):
         if not token_matches_plan(cfg, args, data, p.get("name")):
             log("[丢弃] pending 里的 %s token 和计划对不上，不发了" % p.get("name"))
             continue
-        alive, why_now = still_failed(cfg, api, p.get("taskId"), p.get("executionId"))
+        alive, why_now = still_failed(cfg, api, p.get("taskId"), p.get("executionId"),
+                                      p.get("sentAt"))
         if not alive:
             log("[丢弃] pending 里的 %s 不用重发了：%s" % (p.get("name"), why_now))
             continue
@@ -3363,7 +3482,7 @@ def flush_pending(cfg, api, args, cs, now):
 
 
 def cmd_check(cfg, api, args):
-    """一次性自检：查今天本脚本建的任务，打印判定，默认只查不动作（要重发加 --retry）。"""
+    """一次性自检：查今天本脚本建的任务，明确失败的当场重发（只看不动加 --no-retry）。"""
     now = datetime.now()
     live = {}
     try:
@@ -3375,20 +3494,24 @@ def cmd_check(cfg, api, args):
     if busy:
         log("[只查不写] 自检守护进程（PID %s，%s 起）还在跑：这次结果不落盘，"
             "要看实时进度直接 tail 它的 check_*.log；两份进程各写各的会把同一条重发两遍，"
-            "所以这次 --retry 也不生效。" % (live.get("pid"), live.get("startedAt")))
+            "所以这次不重发——失败的重发交给那个守护进程，它本来就会当场重发。"
+            % (live.get("pid"), live.get("startedAt")))
         args.no_retry = True
     items, stats, cs, _st = check_pass(cfg, api, args, now, reason="手动查", read_only=busy)
     log("[自检] 查了 %d 个任务 / %d 条执行：成功 %d、未定 %d、结果不明 %d、已取消 %d、明确失败 %d、"
-        "读不到 %d（本轮跳过 %d 个没到点或已终态的）"
+        "读不到 %d、客户端已重跑 %d（本轮跳过 %d 个没到点或已终态的）"
         % (stats["tasks"], stats["items"], stats["ok"], stats["pending"], stats["ambiguous"],
-           stats["cancelled"], stats["retryable"], stats["unreadable"], stats["skipped"]))
+           stats["cancelled"], stats["retryable"], stats["unreadable"], stats["rerun"],
+           stats["skipped"]))
     if stats["ambiguous"]:
         log("[提醒] 结果不明 %d 条不自动重发（可能已经发出去了，重复发掉权重）。"
-            "确认账号页没这条再手动 retry --force 或去客户端点重试。" % stats["ambiguous"])
+            "确认账号页没这条后，可以像客户端那样一次性补上：点任务详情页顶部「批量重试」，"
+            "或后台跑 python tk_publish.py retry --task <taskId> --retry-ambiguous。"
+            % stats["ambiguous"])
     n_pending = flush_pending(cfg, api, args, cs, now) if (args.retry and not args.no_retry) else 0
     if args.no_retry or not args.retry:
         if items:
-            log("[待重发] 明确失败 %d 条：%s（加 --retry 才会真建任务）"
+            log("[待重发] 明确失败 %d 条：%s（现在只查不重发）"
                 % (len(items), "、".join(i["name"] for i in items)))
         return
     if not items:
@@ -3399,14 +3522,74 @@ def cmd_check(cfg, api, args):
     log("[重发] 立即建任务 %d 条、排进 pending %d 条、拦下 %d 条" % (sent, deferred, blocked))
 
 
+def cmd_retry(cfg, api, args):
+    """后台版「重试」按钮：把任务里现在失败的几条一次性重新发出去。
+
+    客户端那两个按钮（2026-11-18 从 app.asar + 用户录屏核实）：
+      顶部「批量重试」  -> /cloud-mobile/v1/cloud-mobile/task-main/retry   参数 {taskId}
+                            弹「确定重试所有失败任务吗？不含取消的失败任务数：N」，原地重跑所有失败行
+      行内「重试」      -> /cloud-mobile/v1/cloud-mobile/task-detail/retry 参数 {id: 内部行 id}
+    两条都不在本地开放接口白名单（11-18 拿 10 种拼法直连 6873 全是 E010006；同一批探测里白名单内的
+    task/cancel 回 E010008 参数校验失败，可见 E010006 就是没放行），行内那条连内部行 id
+    开放接口也不回。P5 又不许点界面。所以这里用唯一放行的写路径 video-task/create 按原计划 payload
+    重建一个发布任务，效果等同「把这条视频重新发一遍」，代价是多一个新 taskId、且要守本脚本的
+    让位/截止规则。守护进程 checkd 在跑时默认让位（两个进程会把同一条发两遍）。
+    """
+    now = datetime.now()
+    want = [x.strip() for x in str(args.task or "").split(",") if x.strip()]
+    st = load_sched_state(cfg)
+    cs = load_check_state(cfg)
+    known = set([str(k) for k in (st.get("tasks") or {})] + [str(k) for k in (cs.get("retryTasks") or {})])
+    for tid in want:
+        if tid not in known:
+            log("[不碰] %s：不在本脚本 state 记过的任务里。按 P2 这种只认 taskId 的活儿我不动，"
+                "手工建的任务请在客户端任务详情页点「重试/批量重试」。" % tid)
+    if not any(t in known for t in want) and want:
+        return
+    live = {}
+    try:
+        with io.open(_check_lock_path(cfg), encoding="utf-8") as f:
+            live = json.load(f)
+    except Exception:
+        live = {}
+    busy = pid_alive(live.get("pid")) and int(live.get("pid") or -1) != os.getpid()
+    if busy and not args.force:
+        log("[让位] 自检守护进程（PID %s，%s 起）还在跑，它本来就会当场重发明确失败；"
+            "两个进程一起重发会把同一条发两遍。要替它动手就加 --force（同时建议先确认它卡住了）。"
+            % (live.get("pid"), live.get("startedAt")))
+        return
+    args.force_check = True                     # 手动点重试就该立刻查，别等 15 分钟、也别认旧终态
+    items, stats, cs, _st = check_pass(cfg, api, args, now, reason="手动重发",
+                                       read_only=busy, only=want or None)
+    for tid in (stats.get("not_found") or []):
+        log("[查不到] %s：state 里没有这份任务记录，或已被删除；只重发本脚本建过的任务。" % tid)
+    if not items:
+        log("[重试] 没有「明确失败」的条目可重发（查了 %d 个任务 / %d 条执行：成功 %d、未定 %d、"
+            "结果不明 %d、已取消 %d、客户端已重跑 %d）。"
+            % (stats["tasks"], stats["items"], stats["ok"], stats["pending"],
+               stats["ambiguous"], stats["cancelled"], stats["rerun"]))
+        if stats["ambiguous"]:
+            log("[重试] 结果不明的那几条要一起补发，加 --retry-ambiguous（先确认账号页没发出去过）。")
+        return
+    log("[重试] 待重发 %d 条：%s" % (len(items), "、".join(
+        "%s(%s %s)" % (i["name"] or "?", str(i["mobile"]).split("-")[0], i["why"]) for i in items)))
+    sent, deferred, blocked = retry_pass(cfg, api, args, cs, items, now)
+    log("[重试] 当场建任务 %d 条、排进 pending %d 条、拦下 %d 条%s"
+        % (sent, deferred, blocked, "（dry-run：没真建任务）" if args.dry_run else ""))
+
+
 def cmd_checkd(cfg, api, args):
     """常驻自检：建完 --check-after 分钟查一次；下一轮发布前 --check-before 分钟再查上一轮；
-    到点把 pending 重发出去。只写 tk_publish_check_state.json，不碰守护进程那份。"""
+    明确失败的当场重发（客户端点重试的节奏），要给后面轮次让位的排进 pending 到点再发；
+    接口里发现同一条已被人在客户端重跑，就撤掉自己那条 pending，绝不双发。
+    只写 tk_publish_check_state.json，不碰守护进程那份。"""
     p = acquire_check_lock(cfg, args)
     log("[自检守护] 起于 %s（PID %d）：建完 %d 分钟查一次，下一轮前 %d 分钟再查，"
-        "明确失败自动重发=%s，结果不明自动重发=%s，单条重试上限 %d 次"
+        "明确失败自动重发=%s（当场重发=%s），结果不明自动重发=%s，单条重试上限 %d 次，"
+        "客户端已重跑=认得（撤自己的重发，不双发）"
         % (datetime.now().strftime(TIME_FMT), os.getpid(), int(args.check_after),
-           int(args.check_before), not args.no_retry, bool(args.retry_ambiguous),
+           int(args.check_before), not args.no_retry,
+           bool(not getattr(args, "retry_wait_gap", False)), bool(args.retry_ambiguous),
            int(args.max_retry)))
     stats = {"pending": 0, "retryable": 0, "unreadable": 0, "next_due": None}
     try:
@@ -3443,8 +3626,13 @@ def cmd_checkd(cfg, api, args):
             if not nxt and not (csc.get("pending") or []) and not due \
                     and not stats.get("pending") and not stats.get("retryable") \
                     and not stats.get("unreadable"):
-                log("[自检退出] %s：今天建的任务都查到终态了，后面没有待发轮次，也没有待重发，收工"
-                    % datetime.now().strftime(TIME_FMT))
+                amb = int(stats.get("ambiguous") or 0)
+                log("[自检退出] %s：今天建的任务后面没有待发轮次，也没有待重发，收工。%s"
+                    % (datetime.now().strftime(TIME_FMT),
+                       ("还有 %d 条「结果不明」没落定，得人工看一眼（确认账号页没这条后，"
+                        "客户端点「批量重试」或跑 python tk_publish.py retry --task <taskId> "
+                        "--retry-ambiguous）；要我继续盯就重起 checkd" % amb) if amb else
+                       "本轮查到的都已落定"))
                 break
             wake = max(wake, now + timedelta(seconds=30))
             secs = max(int((wake - datetime.now()).total_seconds()), 30)
@@ -3823,7 +4011,7 @@ def task_name_guard(api):
     """任务名避让：开放接口对重名任务直接 E114208 整条打回，视频等于没发。
 
     2026-11-17 15:30 那次守护进程按 plan 落盘时的固定序号命名（新建任务2002-1/-2），
-    撞上 14:41 那批已建的同名任务，第一条 松鼠花盆-09 就被拒了。所以名字必须现取现让：
+    撞上 14:41 那批已建的同名任务，第一条 示例产品A-01 就被拒了。所以名字必须现取现让：
     任务列表每 60 秒刷一次，本进程内取过的名字先占住。
     """
     cache = {"ts": 0.0, "taken": set()}
@@ -4036,14 +4224,14 @@ def main():
     ap = argparse.ArgumentParser(description="Hubstudio 批量发视频 后台自动上架脚本")
     ap.add_argument("command", choices=["plan", "submit", "status", "watch", "phones", "ledger",
                                         "cancel", "pack", "paste", "verify", "watchdog", "retime", "schedule",
-                                        "today", "check", "checkd"])
+                                        "today", "check", "checkd", "retry"])
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                      "tk_publish.config.json"))
     ap.add_argument("--token", default="")
     ap.add_argument("--retry-export", default="", help="Hubstudio 导出的运行结果 xlsx，只重发其中失败的行")
     ap.add_argument("--include-reason", default="", help="只重发这些失败原因，逗号分隔，如 商品添加失败,取消执行")
     ap.add_argument("--limit", type=int, default=0, help="只取前 N 条，便于小批量试跑")
-    ap.add_argument("--only", default="", help="只发视频名包含这些关键字的行，逗号分隔，如 蘑菇灯-08,蘑菇灯-13")
+    ap.add_argument("--only", default="", help="只发视频名包含这些关键字的行，逗号分隔，如 示例产品A-01,示例产品A-02")
     ap.add_argument("--exclude", default="",
                     help="反着筛：视频名/路径含这些关键字的行剔掉不发，逗号分隔。"
                          "台账状态滞后、导出表里又没有今天的结果时，用它挡掉已经发成功的那几条（重复发布很伤）")
@@ -4053,7 +4241,9 @@ def main():
                          "（等价于 config.publish.alloc.enabled=true）")
     ap.add_argument("--max-day", dest="max_day", type=int, default=0,
                     help="配合 --alloc：单账号环境「今日累计（新增+今日已发）」上限，超出就往权重次高的号挪；0=不限制")
-    ap.add_argument("--task", default="", help="watch/cancel 指定 taskId")
+    ap.add_argument("--task", default="", help="watch/cancel/retry 指定 taskId（retry 可逗号给多个；留空=今天本脚本建的全部任务）")
+    ap.add_argument("--force", action="store_true",
+                    help="retry：自检守护进程还在跑也要自己动手（先确认它真的卡住了，否则两个进程会把同一条发两遍）")
     ap.add_argument("--interval", type=int, default=120, help="watch 轮询秒数")
     ap.add_argument("--once", action="store_true", help="watch 只跑一轮")
     ap.add_argument("--size", type=int, default=50, help="status 显示条数")
@@ -4102,15 +4292,20 @@ def main():
                     help="checkd：下一轮发布前多少分钟再查上一轮（默认 15）")
     ap.add_argument("--check-interval", dest="check_interval", type=int, default=5,
                     help="checkd：最长多久查一圈（分钟，默认 5；到点事件会提前唤醒）")
-    ap.add_argument("--retry", action="store_true",
-                    help="check：明确失败的条目自动重发（checkd 默认就重发，这条是给一次性 check 用的）")
+    ap.add_argument("--retry", dest="retry", action="store_true", default=True,
+                    help="check：明确失败当场重发（2026-11-18 起这是默认行为，checkd 也一样；只看不动用 --no-retry）")
     ap.add_argument("--no-retry", dest="no_retry", action="store_true",
                     help="checkd/check：只查只记，不建重发任务（先观察时用这个）")
     ap.add_argument("--retry-now", dest="retry_now", action="store_true",
-                    help="重发不等间隔下限，立刻建任务（会压短同一台环境的间隔，默认不用）")
+                    help="重发连「给这台接下来还没发的轮次让位」都不等，立刻建任务"
+                         "（会压短同一台环境的发布间隔，确认要这样才用）")
+    ap.add_argument("--retry-wait-gap", dest="retry_wait_gap", action="store_true",
+                    help="退回旧行为：明确失败也要等满「这台今天最后一次发布 + min_spacing_minutes」才重发"
+                         "（默认不等——那次根本没发出去，客户端点重试也是当场就发）")
     ap.add_argument("--retry-ambiguous", dest="retry_ambiguous", action="store_true",
                     help="把「结果不明」（已有链接 / 4041 / E114204）也当失败重发。"
-                         "默认绝不这么做：这类很可能已经发出去了，重复发布掉权重")
+                         "默认绝不这么做：这类很可能已经发出去了，重复发布掉权重。"
+                         "放宽出来的条目仍旧等满间隔，不享受当场重发")
     ap.add_argument("--max-retry", dest="max_retry", type=int, default=1,
                     help="单条视频今天最多自动重发几次（默认 1，超过只报不试，避免重试套重试）")
     ap.add_argument("--force-check", dest="force_check", action="store_true",
@@ -4164,6 +4359,8 @@ def main():
         cmd_check(cfg, api, args)
     elif args.command == "checkd":
         cmd_checkd(cfg, api, args)
+    elif args.command == "retry":
+        cmd_retry(cfg, api, args)
     else:
         die("未实现的命令：%s" % args.command)
 

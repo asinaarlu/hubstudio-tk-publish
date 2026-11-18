@@ -57,14 +57,15 @@ powershell -ExecutionPolicy Bypass -File launch_checkd.ps1 -Token <同一个令�
 | `verify` | 按令牌重跑核对与自检 | 只读 |
 | `submit` | 立刻提交（一次性） | **写：建任务** |
 | `schedule` | 常驻守护，到点批量提交 | **写：建任务** |
-| `check` | 查执行明细、判成功/失败/结果不明 | 只读 |
+| `check` | 查执行明细、判成功/失败/结果不明 | **写：明确失败当场重发**（只看不动加 `--no-retry`） |
 | `checkd` | 自检 + 失败重发守护 | **写：可建重发任务** |
+| `retry` | 一行命令重发某个任务的失败条目，等价在任务详情页点「重试」 | **写：可建重发任务** |
 | `watch` / `status` | 盯任务进度 | 只读 |
 | `watchdog` | 巡检守护进程与状态是否打架 | 只读 |
 | `cancel` | 取消任务（仅限本脚本 state 里记下的） | **写：取消** |
 | `pack` / `paste` / `retime` | 出客户端批量粘贴包、写剪贴板、改时间 | 本地文件 |
 
-常用参数：`--config` `--token` `--only` `--exclude` `--start-time` `--spacing` `--schedule` `--one-per-task` `--max-day` `--check-after` `--check-before` `--check-interval` `--max-retry` `--no-retry` `--retry-ambiguous` `--no-out` `--skip-url-check` `--no-upload` `--write-back` `--in-place` `--dry-run`。
+常用参数：`--config` `--token` `--only` `--exclude` `--task` `--start-time` `--spacing` `--schedule` `--one-per-task` `--max-day` `--check-after` `--check-before` `--check-interval` `--max-retry` `--no-retry` `--retry-wait-gap` `--retry-now` `--retry-ambiguous` `--force-check` `--force` `--no-out` `--skip-url-check` `--no-upload` `--write-back` `--in-place` `--dry-run`。
 
 退出码只有一个非零值：**成功 0，其余一律 2**（内部统一 `die(msg, code=2)`），适合直接拿来做批处理判断。
 
@@ -94,7 +95,8 @@ powershell -ExecutionPolicy Bypass -File launch_checkd.ps1 -Token <同一个令�
 ## 已知边界（不是 bug，是接口给不了）
 
 - `video-task/create` 不解析任何时间字段，试过 21 个候选字段名全部无效。"定时发布"靠的是脚本自己等到点再提交，或者用客户端向导。
-- 没有重试接口。所谓自动重发，是脚本拿原计划载荷**重建一个任务**。
+- **没有重试接口**。客户端那两个按钮走的是内部路由（顶部"批量重试"= `task-main/retry {taskId}`，行内"重试"= `task-detail/retry {内部行 id}`），都不在本地开放接口的 11 条 tk-automation 白名单里：10 种路径写法加假 taskId 直连一律 `E010006`（对照组用白名单内的 `task/cancel` 回 `E010008`，证明不是拼错）。行内重试还缺参数——`task/execution/page` 不回那个内部行 id。所以所谓自动重发，是脚本拿原计划载荷**重建一个任务**：文案、商品 ID、首评、已上传好的视频地址逐字复用。
+- 界面点重试是**原地重跑**：`executionId` 不变，只把 `startedAt` 刷新。脚本比每一圈的执行快照认得这个指纹（`externally_rerun`），发现"这条已经被点过了"就把自己的重发撤掉，不会和界面撞成同账号双发。
 - 自检守护的退出条件不看 `4041/E114204` 这类"结果不明"，日志说"全部落定"时不代表结果不明的那几条已经查清，那部分必须人工确认。
 
 ## 目录结构
