@@ -3072,6 +3072,7 @@ def check_pass(cfg, api, args, now=None, reason="", read_only=False, only=None):
     after = max(int(getattr(args, "check_after", CHECK_AFTER_MIN)), 0)
     checks = cs.setdefault("checks", {})
     cache = {}
+    fcache = {}
     retryable = []
     rerun_keys = set()
     stats = {"tasks": 0, "items": 0, "ok": 0, "pending": 0, "ambiguous": 0,
@@ -3141,6 +3142,17 @@ def check_pass(cfg, api, args, now=None, reason="", read_only=False, only=None):
                 kind, why = "pending", "已被客户端重试（%s），先看它自己的结果｜原判定：%s" % (rerun_why, why)
             elif rerun:
                 why = "%s｜已被客户端重试（%s）" % (why, rerun_why)
+            # 脚本自己已经补发过的：原任务里那行会永远停在 FAILED，不能继续当「还要重试」报出去，
+            # 更不能喊交人工——补发可能正在跑、也可能已经发出去了，照旧记录手工再发就是同账号双发。
+            if kind == "retryable" and not relaxed:
+                fkey = str(m.get("name") or "").lower()
+                frec = (cs.get("retries") or {}).get(fkey) if fkey else None
+                if frec and frec.get("retryTaskId") and str(frec.get("retryTaskId")) != str(tid):
+                    fkind, fwhy = follow_up_state(api, frec, fcache)
+                    if fkind in ("ok", "pending"):
+                        ftag = str(frec.get("retryTaskName") or frec.get("retryTaskId"))
+                        kind = "ok" if fkind == "ok" else "pending"
+                        why = "本脚本已补发（%s）：%s｜原任务那行仍记 %s" % (ftag, fwhy, why)
             items.append({"mobileId": x.get("mobileId"), "name": m.get("name") or "",
                           "mobile": m.get("mobile") or "", "executionId": x.get("executionId"),
                           "status": x.get("status"), "errorCode": x.get("errorCode"),
@@ -3308,6 +3320,40 @@ def token_matches_plan(cfg, args, data, name=""):
     return False
 
 
+def follow_up_state(api, rec, cache):
+    """脚本自己建的那条补发任务，现在到底是什么结果。
+
+    原任务里那行失败记录不会自己变成功（客户端点重试才是原地重跑，脚本补发是新建任务），
+    所以「已试过 N 次，交人工」绝不能只看原行——补发可能还在跑、也可能已经发出去了。
+    返回 (判定, 说明)，判定同 classify_execution；没建过补发任务返回 (None, "")。
+    """
+    tid = str(rec.get("retryTaskId") or "")
+    if not tid:
+        return None, ""
+    if tid not in cache:
+        try:
+            cache[tid] = api.executions(tid, size=50)
+        except ApiError as e:
+            cache[tid] = None
+            cache["%s#err" % tid] = "%s" % e.res.get("code")
+    rows = cache.get(tid)
+    if rows is None:
+        return None, "补发任务读不到（%s）" % (cache.get("%s#err" % tid) or "空")
+    if not rows:
+        return None, "补发任务里还没有执行明细"
+    want = str(rec.get("mobileId") or "")
+    best, best_at = None, None
+    for r in rows:
+        if str(r.get("mobileId")) != want:
+            continue
+        at = _ts(r.get("startedAt")) or _ts(r.get("createdAt")) or datetime.min
+        if best is None or at >= best_at:
+            best, best_at = r, at
+    if best is None:
+        return None, "补发任务里没有这台环境"
+    return classify_execution(best, datetime.now())
+
+
 def retry_pass(cfg, api, args, cs, items, now=None):
     """明确失败的条目 -> 算时刻 -> 建重发任务（后台等价客户端「重试」按钮）。
 
@@ -3323,6 +3369,7 @@ def retry_pass(cfg, api, args, cs, items, now=None):
         and bool(getattr(args, "retry_immediate", True))
     _path, sched = active_plan(cfg)
     cache, batches, deferred, blocked = {}, [], [], []
+    fcache = {}
     queued, seen = {}, set()
     for it in items:
         key = it.get("key") or "%s#%s" % (it["taskId"], it["index"])
@@ -3330,7 +3377,24 @@ def retry_pass(cfg, api, args, cs, items, now=None):
         rec = (cs.get("retries") or {}).get(key) or {}
         tried = int(rec.get("attempts") or 0) + queued.get(key, 0)
         if tried >= max_retry:
-            blocked.append("%s（已试过 %d 次，上限 %d，交人工）" % (it["name"], tried, max_retry))
+            # 额度用完了，但补发任务自己可能还在跑、或者已经发出去了——先问它，别急着喊交人工。
+            tag = str(rec.get("retryTaskName") or rec.get("retryTaskId") or "")
+            kind, fwhy = (follow_up_state(api, rec, fcache) if rec.get("retryTaskId")
+                          else (None, "没建过补发任务（上次建任务被接口打回了？）"))
+            if kind in ("ok", "pending"):
+                if rec.get("followReported") != kind:
+                    rec["followReported"] = kind
+                    log("[补发%s] %s（%s taskId=%s %s）—— 原任务里那行还是 FAILED，"
+                        "别照着旧记录手工再发，等补发自己的结果"
+                        % ("已发布" if kind == "ok" else "进行中", it["name"], tag,
+                           rec.get("retryTaskId"), fwhy))
+                continue
+            blocked.append("%s（已试过 %d 次，上限 %d；补发 %s %s，交人工）"
+                           % (it["name"], tried, max_retry, tag or "（无）",
+                              {"retryable": "仍明确失败：%s" % fwhy,
+                               "ambiguous": "结果不明：%s" % fwhy,
+                               "cancelled": "已取消：%s" % fwhy}.get(
+                                  kind, "状态未知：%s" % (fwhy or "查不到"))))
             continue
         data = load_plan_data(cfg, it["plan"], cache)
         if not data:
