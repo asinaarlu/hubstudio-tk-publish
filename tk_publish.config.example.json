@@ -1,0 +1,103 @@
+{
+  "_说明": "示例配置：复制成 tk_publish.config.json 后，把带 <> 的占位换成你自己的值。脚本只读这个文件，改配置不用动 tk_publish.py。真实配置不要提交到仓库（.gitignore 已排除）。",
+
+  "hubstudio": {
+    "_说明": "Hubstudio 本机开放接口地址，默认端口 6873。min_interval_sec 是连续两次请求的最小间隔，用于自我保护。",
+    "host": "127.0.0.1",
+    "port": 6873,
+    "min_interval_sec": 0.8
+  },
+
+  "outputs_dir": "./outputs",
+
+  "ledger": {
+    "_说明": "台账 = 你要发什么。脚本只读台账，写回默认落在 outputs 的副本，不动原件（除非显式加 --write-back）。",
+    "path": "./data/发布跟踪表.xlsx",
+    "sheet": "发布跟踪",
+    "columns": {
+      "seq": "序号",
+      "name": "视频名称",
+      "video": "视频文件路径",
+      "caption": "发布文案的路径",
+      "status": "发布状态"
+    },
+    "unpublished_values": ["未发布", ""],
+    "published_value": "已发布"
+  },
+
+  "products": {
+    "_说明": "小黄车商品匹配规则：视频名命中 match 里任一词就挂这条商品。productId 判据 ^\\d{6,50}$；productTitle 最多 30 字符且禁 % 反斜杠 + 竖线 双引号 「」，留空则该行走 WARN 不挂标题。title_by_video 逐条覆盖，优先级高于 productTitle，键用台账里的视频名（可不带 .mp4）。",
+    "list": [
+      {
+        "match": ["产品A"],
+        "productId": "<你的商品ID，例 1740000000000000001>",
+        "productTitle": "",
+        "title_by_video": {
+          "产品A-01": "Sample Product Title One",
+          "产品A-02": "Sample Product Title Two"
+        }
+      },
+      {
+        "match": ["产品B"],
+        "productId": "<你的商品ID>",
+        "productTitle": "Sample Product Title B"
+      }
+    ]
+  },
+
+  "comment_by_video": {
+    "_说明": "商家首评（发布后置顶的第一条评论），键为视频名不含扩展名，值上限 200 字符。注意避开平台禁止的极限词。",
+    "产品A-01": "（示例首评文案：说清楚卖点或售后即可，别带极限词）",
+    "产品A-02": "（示例首评文案）"
+  },
+
+  "phones": {
+    "_说明": "账号环境按 serialNumber 匹配（比名字稳），匹配不到会报出并跳过。weight 是档位权重：enabled=true 时 plan/pack 按最大余数法把 N 条拆到各号，不再平均轮转。",
+    "list": [
+      { "name": "<Hubstudio 账号环境名 1>", "serial": 100000001, "weight": 2 },
+      { "name": "<Hubstudio 账号环境名 2>", "serial": 100000002, "weight": 1 }
+    ]
+  },
+
+  "publish": {
+    "_说明": "排期默认：起始时间 = 此刻现实时间（不传 --start-time 就按下一整分钟起算）。auto_spacing=true 时间隔 = max(round_spacing_minutes, (当天 day_last_deadline - 起始) // (单环境条数-1))，条少摊得开、条多压到下限，但每条不低于 round_spacing_minutes；当天最晚一条不越过 day_last_deadline。spacing_minutes 只在 auto_spacing=false 或显式传 --spacing 时当固定间隔用；min_spacing_minutes 是同一台相邻两条的硬下限。schedule_mode：immediate 立即 / fixed 固定时间 / caption_window 按文案里的时间窗 / wizard 只出粘贴包走客户端向导。",
+    "task_name_prefix": "新建任务",
+    "schedule_mode": "caption_window",
+    "fixed_time": "",
+    "auto_spacing": true,
+    "min_spacing_minutes": 30,
+    "round_spacing_minutes": 60,
+    "day_last_deadline": "22:00",
+    "spacing_minutes": 60,
+    "mobile_spacing_minutes": 5,
+    "queue_when_busy": true,
+    "alloc": {
+      "enabled": true,
+      "used_today": true,
+      "max_day_per_mobile": 12
+    },
+    "enable_aigc": false,
+    "get_leads": false,
+    "location": "",
+    "chunk_size": 15
+  },
+
+  "video_source": {
+    "_说明": "本地 mp4 转公网 URL 走 Hubstudio 自己的对象存储：POST /api/v1/cloud-mobile/get-s3-url 拿预签名 PUT 地址，PUT 完去掉 query 就是 videoUrl。这条路由不需要云手机开机。mode：s3 上传 / url_prefix 拼固定前缀 / map 读映射文件 / unset 不处理。channelId 用你客户端实际的频道号。上传结果缓存在 outputs/tk_publish_upload_cache.json，文件改过会自动重传。",
+    "mode": "s3",
+    "channel_id": 1,
+    "scene": "taskVideo",
+    "bucket_code": "public",
+    "url_prefix": "",
+    "root": "<你的视频根目录，例 D:/videos>",
+    "map_file": ""
+  },
+
+  "caption": {
+    "_说明": "TK 只有一个文案框，所以标题会拼成正文第一行（include_title）、话题标签拼到末尾（include_hashtags）；use_pinned_comment=true 时把首评置顶填进 comment 字段（上限 200 字符）。max_caption_chars 取 1000：客户端表单默认限 1000 字符，超过会被拦住。",
+    "include_title": true,
+    "include_hashtags": true,
+    "use_pinned_comment": true,
+    "max_caption_chars": 1000
+  }
+}

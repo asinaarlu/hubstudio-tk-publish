@@ -1,0 +1,30 @@
+# 真实配置与运行产物一律不入库（里面有账号环境名、serialNumber、商品ID、一次性令牌）
+tk_publish.config.json
+tk_publish_plan_*.json
+tk_publish_state.json
+tk_publish_schedule_state.json
+tk_publish_check_state.json
+tk_publish_upload_cache.json
+tk_publish_schedule.lock
+tk_publish_check.lock
+*.log
+*.log.err
+plans/
+outputs/
+data/
+
+# 备份与临时件
+*.bak
+*.bak-*
+*.tmp
+~$*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 系统
+.DS_Store
+Thumbs.db
